@@ -71,6 +71,7 @@ export default function Home() {
   const [status, setStatus] = useState('');
   const [tx, setTx] = useState('');
   const [paymentLink, setPaymentLink] = useState('');
+  const [paymentSuccess, setPaymentSuccess] = useState(false);
 
   const connect = async () => {
     if (!window.ethereum) {
@@ -161,13 +162,15 @@ export default function Home() {
     }
 
     try {
+      setPaymentSuccess(false);
+      setTx('');
+
       const wallet = createWalletClient({
         chain: base,
         transport: custom(window.ethereum),
       });
 
       const value = parseUnits(amount, 6);
-
       const linkId = makeLinkId(recipient, amount, memo);
 
       setStatus('Approve USDC in your wallet...');
@@ -196,8 +199,10 @@ export default function Home() {
       });
 
       setTx(hash);
-      setStatus('Payment submitted successfully.');
+      setPaymentSuccess(true);
+      setStatus('Payment successful!');
     } catch (e) {
+      setPaymentSuccess(false);
       setStatus(
         e instanceof Error ? e.message : 'Payment failed.'
       );
@@ -307,21 +312,44 @@ export default function Home() {
           Pay USDC
         </button>
 
-        {status && (
-          <p className="status">{status}</p>
+        {paymentSuccess && tx && (
+          <div className="status">
+            <h3>✓ Payment Successful</h3>
+
+            <p>
+              <strong>{amount} USDC</strong> paid successfully.
+            </p>
+
+            <p>
+              Recipient:{' '}
+              {recipient.slice(0, 6)}...
+              {recipient.slice(-4)}
+            </p>
+
+            <p>
+              <a
+                href={`https://basescan.org/tx/${tx}`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                View Transaction on BaseScan →
+              </a>
+            </p>
+
+            <button
+              onClick={() => {
+                setPaymentSuccess(false);
+                setTx('');
+                setStatus('');
+              }}
+            >
+              Create New Payment
+            </button>
+          </div>
         )}
 
-        {tx && (
-          <p>
-            Transaction:{' '}
-            <a
-              href={`https://basescan.org/tx/${tx}`}
-              target="_blank"
-              rel="noreferrer"
-            >
-              View on BaseScan
-            </a>
-          </p>
+        {status && !paymentSuccess && (
+          <p className="status">{status}</p>
         )}
       </section>
     </main>
