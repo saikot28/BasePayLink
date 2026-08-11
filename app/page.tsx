@@ -10,6 +10,7 @@ import {
   stringToBytes,
 } from 'viem';
 import { base } from 'viem/chains';
+import { QRCodeSVG } from 'qrcode.react';
 
 const USDC =
   '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as Address;
@@ -158,6 +159,7 @@ export default function Home() {
         `&memo=${encodeURIComponent(memo)}`;
 
       setPaymentLink(url);
+      setCopied(false);
       setStatus('Payment link created.');
     } catch {
       setStatus('Could not create payment link.');
@@ -169,6 +171,7 @@ export default function Home() {
 
     try {
       await navigator.clipboard.writeText(paymentLink);
+
       setCopied(true);
 
       setTimeout(() => {
@@ -176,6 +179,30 @@ export default function Home() {
       }, 2000);
     } catch {
       setStatus('Could not copy the link.');
+    }
+  };
+
+  const shareLink = async () => {
+    if (!paymentLink) return;
+
+    try {
+      if (navigator.share) {
+        await navigator.share({
+          title: 'BasePayLink Payment',
+          text: `Pay ${amount} USDC on Base`,
+          url: paymentLink,
+        });
+      } else {
+        await navigator.clipboard.writeText(paymentLink);
+
+        setCopied(true);
+
+        setTimeout(() => {
+          setCopied(false);
+        }, 2000);
+      }
+    } catch {
+      // User cancelled sharing.
     }
   };
 
@@ -448,13 +475,61 @@ export default function Home() {
                   }
                 />
 
-                <button
-                  onClick={copyLink}
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: '10px',
+                    flexWrap: 'wrap',
+                    marginTop: '10px',
+                  }}
                 >
-                  {copied
-                    ? '✓ Copied'
-                    : 'Copy Link'}
-                </button>
+                  <button onClick={copyLink}>
+                    {copied
+                      ? '✓ Copied'
+                      : 'Copy Link'}
+                  </button>
+
+                  <button onClick={shareLink}>
+                    Share
+                  </button>
+                </div>
+
+                <div
+                  style={{
+                    marginTop: '20px',
+                    textAlign: 'center',
+                  }}
+                >
+                  <p>
+                    <strong>
+                      Scan to Pay
+                    </strong>
+                  </p>
+
+                  <div
+                    style={{
+                      display: 'inline-block',
+                      background: '#ffffff',
+                      padding: '16px',
+                      borderRadius: '12px',
+                    }}
+                  >
+                    <QRCodeSVG
+                      value={paymentLink}
+                      size={220}
+                      level="M"
+                    />
+                  </div>
+
+                  <p
+                    style={{
+                      marginTop: '10px',
+                    }}
+                  >
+                    Scan this QR code to open
+                    the payment request.
+                  </p>
+                </div>
               </div>
             )}
 
