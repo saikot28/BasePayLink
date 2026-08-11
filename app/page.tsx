@@ -10,6 +10,8 @@ import {
   type Address,
   keccak256,
   stringToBytes,
+  formatUnits,
+  getAddress,
 } from 'viem';
 import { base } from 'viem/chains';
 import { QRCodeSVG } from 'qrcode.react';
@@ -18,7 +20,8 @@ const USDC =
   '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as Address;
 
 const PAYMENT_CONTRACT =
-  '0x0650a97C4d0a130E8aEa7852fA780B97fED5888C' as Address;
+  (process.env.NEXT_PUBLIC_PAYMENT_CONTRACT ||
+    '0x0650a97C4d0a130E8aEa7852fA780B97fED5888C') as Address;
 
 const publicClient = createPublicClient({
   chain: base,
@@ -53,10 +56,9 @@ const paymentAbi = [
   },
 ] as const;
 
-const paymentEventAbi = {
+const paymentEvent = {
   type: 'event',
   name: 'Payment',
-  anonymous: false,
   inputs: [
     {
       indexed: true,
@@ -86,6 +88,16 @@ const paymentEventAbi = {
   ],
 } as const;
 
+type PaymentItem = {
+  linkId: `0x${string}`;
+  payer: Address;
+  recipient: Address;
+  amount: bigint;
+  memo: string;
+  txHash: `0x${string}`;
+  blockNumber: bigint;
+};
+
 declare global {
   interface Window {
     ethereum?: {
@@ -96,16 +108,6 @@ declare global {
     };
   }
 }
-
-type PaymentRecord = {
-  linkId: string;
-  payer: string;
-  recipient: string;
-  amount: bigint;
-  memo: string;
-  transactionHash: string;
-  blockNumber: bigint;
-};
 
 function makeLinkId(
   recipient: string,
@@ -119,47 +121,33 @@ function makeLinkId(
   );
 }
 
-function shortenAddress(address: string): string {
+function shortAddress(address: string) {
+  if (!address) return '';
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
-function formatUSDC(amount: bigint): string {
-  return (Number(amount) / 1_000_000).toFixed(2);
-}
-
 export default function Home() {
-  const [address, setAddress] =
-    useState<Address>();
+  const [address, setAddress] = useState<Address>();
 
-  const [amount, setAmount] =
-    useState('1');
+  const [amount, setAmount] = useState('1');
+  const [recipient, setRecipient] = useState('');
+  const [memo, setMemo] = useState('BasePayLink payment');
 
-  const [recipient, setRecipient] =
-    useState('');
+  const [status, setStatus] = useState('');
+  const [tx, setTx] = useState('');
 
-  const [memo, setMemo] =
-    useState('BasePayLink payment');
-
-  const [status, setStatus] =
-    useState('');
-
-  const [tx, setTx] =
-    useState('');
-
-  const [paymentLink, setPaymentLink] =
-    useState('');
-
+  const [paymentLink, setPaymentLink] = useState('');
   const [paymentSuccess, setPaymentSuccess] =
     useState(false);
 
   const [isPaymentPage, setIsPaymentPage] =
     useState(false);
 
-  const [copied, setCopied] =
-    useState(false);
+  const [copied, setCopied] = useState(false);
 
-  const [payments, setPayments] =
-    useState<PaymentRecord[]>([]);
+  const [payments, setPayments] = useState<PaymentItem[]>(
+    []
+  );
 
   const [historyLoading, setHistoryLoading] =
     useState(false);
@@ -167,6 +155,42 @@ export default function Home() {
   const [historyError, setHistoryError] =
     useState('');
 
+  const [historyLoaded, setHistoryLoaded] =
+    useState(false);
+
+  /*
+   * Read payment request from URL
+   */
+  useEffect(() => {
+    const params = new URLSearchParams(
+      window.location.search
+    );
+
+    const pay = params.get('pay');
+    const r = params.get('recipient');
+    const a = params.get('amount');
+    const m = params.get('memo');
+
+    if (r) {
+      setRecipient(r);
+    }
+
+    if (a) {
+      setAmount(a);
+    }
+
+    if (m) {
+      setMemo(m);
+    }
+
+    if (pay && r && a) {
+      setIsPaymentPage(true);
+    }
+  }, []);
+
+  /*
+   * Connect wallet
+   */
   const connect = async () => {
     if (!window.ethereum) {
       setStatus(
@@ -191,17 +215,23 @@ export default function Home() {
         return;
       }
 
-      setAddress(accounts[0] as Address);
-      setStatus('Wallet connected to Base Mainnet.');
-    } catch (e) {
+      setAddress(getAddress(accounts[0]));
+
       setStatus(
-        e instanceof Error
-          ? e.message
+        'Wallet connected to Base Mainnet.'
+      );
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? error.message
           : 'Wallet connection failed.'
       );
     }
   };
 
+  /*
+   * Create payment link
+   */
   const createPaymentLink = () => {
     if (!/^0x[a-fA-F0-9]{40}$/.test(recipient)) {
       setStatus('Enter a valid recipient address.');
@@ -234,10 +264,15 @@ export default function Home() {
       setPaymentLink(url);
       setStatus('Payment link created.');
     } catch {
-      setStatus('Could not create payment link.');
+      setStatus(
+        'Could not create payment link.'
+      );
     }
   };
 
+  /*
+   * Copy link
+   */
   const copyLink = async () => {
     if (!paymentLink) {
       return;
@@ -258,19 +293,119 @@ export default function Home() {
     }
   };
 
+  /*
+   * Load payment history from Base
+   */
+  const loadPaymentHistory = async () => {
+    setHistoryLoading(true);
+    setHistoryError('');
+
+    try {
+      const latestBlock =
+        await publicClient.getBlockNumber();
+
+      /*
+       * Search recent blocks.
+       * This is suitable for the MVP.
+       */
+      const SEARCH_BLOCKS = 3_000_000n;
+
+      const fromBlock =
+        latestBlock > SEARCH_BLOCKS
+          ? latestBlock - SEARCH_BLOCKS
+          : 0n;
+
+      const logs =
+        await publicClient.getLogs({
+          address: PAYMENT_CONTRACT,
+          event: paymentEvent,
+          fromBlock,
+          toBlock: latestBlock,
+        });
+
+      const items: PaymentItem[] = [];
+
+      for (const log of logs) {
+        const payer = log.args.payer;
+        const recipient =
+          log.args.recipient;
+        const amount = log.args.amount;
+        const linkId = log.args.linkId;
+        const memo = log.args.memo;
+
+        if (
+          !payer ||
+          !recipient ||
+          amount === undefined ||
+          !linkId ||
+          !log.transactionHash
+        ) {
+          continue;
+        }
+
+        items.push({
+          linkId,
+          payer,
+          recipient,
+          amount,
+          memo: memo || '',
+          txHash: log.transactionHash,
+          blockNumber:
+            log.blockNumber || 0n,
+        });
+      }
+
+      items.reverse();
+
+      setPayments(items);
+      setHistoryLoaded(true);
+    } catch (error) {
+      console.error(
+        'Payment history error:',
+        error
+      );
+
+      setHistoryError(
+        error instanceof Error
+          ? error.message
+          : 'Could not load payment history.'
+      );
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  /*
+   * Load history on page load
+   */
+  useEffect(() => {
+    loadPaymentHistory();
+  }, []);
+
+  /*
+   * Pay USDC
+   */
   const pay = async () => {
     if (!window.ethereum) {
-      setStatus('Please install a browser wallet.');
+      setStatus(
+        'Please install a browser wallet.'
+      );
       return;
     }
 
     if (!address) {
-      setStatus('Connect your wallet first.');
+      setStatus(
+        'Connect your wallet first.'
+      );
       return;
     }
 
-    if (!/^0x[a-fA-F0-9]{40}$/.test(recipient)) {
-      setStatus('Invalid recipient address.');
+    if (
+      !/^0x[a-fA-F0-9]{40}$/.test(recipient)
+    ) {
+      setStatus(
+        'Invalid recipient address.'
+      );
       return;
     }
 
@@ -280,7 +415,9 @@ export default function Home() {
       !Number.isFinite(numericAmount) ||
       numericAmount <= 0
     ) {
-      setStatus('Enter a valid amount.');
+      setStatus(
+        'Enter a valid amount.'
+      );
       return;
     }
 
@@ -293,7 +430,10 @@ export default function Home() {
         transport: custom(window.ethereum),
       });
 
-      const value = parseUnits(amount, 6);
+      const value = parseUnits(
+        amount,
+        6
+      );
 
       const linkId = makeLinkId(
         recipient,
@@ -338,245 +478,91 @@ export default function Home() {
       setPaymentSuccess(true);
       setStatus('');
 
+      /*
+       * Refresh history after transaction
+       */
       setTimeout(() => {
         loadPaymentHistory();
-      }, 4000);
-    } catch (e) {
+      }, 5000);
+    } catch (error) {
       setPaymentSuccess(false);
 
       setStatus(
-        e instanceof Error
-          ? e.message
+        error instanceof Error
+          ? error.message
           : 'Payment failed.'
       );
     }
   };
 
+  /*
+   * Reset payment
+   */
   const resetPayment = () => {
     setPaymentSuccess(false);
     setTx('');
     setStatus('');
   };
 
-  const loadPaymentHistory = async () => {
-    setHistoryLoading(true);
-    setHistoryError('');
+  /*
+   * Statistics
+   */
+  const totalVolume = payments.reduce(
+    (total, payment) =>
+      total + payment.amount,
+    0n
+  );
 
-    try {
-      const latestBlock =
-        await publicClient.getBlockNumber();
-
-      const deploymentBlock = 0n;
-      const batchSize = 1900n;
-
-      const allLogs: any[] = [];
-
-      let toBlock = latestBlock;
-
-      while (toBlock >= deploymentBlock) {
-        const fromBlock =
-          toBlock - batchSize >
-          deploymentBlock
-            ? toBlock - batchSize
-            : deploymentBlock;
-
-        const logs =
-          await publicClient.getLogs({
-            address: PAYMENT_CONTRACT,
-            event: paymentEventAbi,
-            fromBlock,
-            toBlock,
-          });
-
-        allLogs.push(...logs);
-
-        if (fromBlock === deploymentBlock) {
-          break;
-        }
-
-        toBlock = fromBlock - 1n;
-
-        if (allLogs.length >= 100) {
-          break;
-        }
-      }
-
-      const records: PaymentRecord[] =
-        allLogs
-          .map((log: any) => {
-            const args = log.args;
-
-            if (
-              !args ||
-              !args.linkId ||
-              !args.payer ||
-              !args.recipient
-            ) {
-              return null;
-            }
-
-            return {
-              linkId: args.linkId,
-              payer: args.payer,
-              recipient: args.recipient,
-              amount: args.amount,
-              memo: args.memo || '',
-              transactionHash:
-                log.transactionHash,
-              blockNumber:
-                log.blockNumber,
-            };
-          })
-          .filter(
-            (
-              item: PaymentRecord | null
-            ): item is PaymentRecord =>
-              item !== null
-          );
-
-      records.sort((a, b) => {
-        if (a.blockNumber === b.blockNumber) {
-          return 0;
-        }
-
-        return a.blockNumber > b.blockNumber
-          ? -1
-          : 1;
-      });
-
-      setPayments(records.slice(0, 50));
-    } catch (e) {
-      console.error(
-        'Payment history error:',
-        e
-      );
-
-      setHistoryError(
-        'Could not load payment history.'
-      );
-    } finally {
-      setHistoryLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    const params =
-      new URLSearchParams(
-        window.location.search
-      );
-
-    const payParam =
-      params.get('pay');
-
-    const r =
-      params.get('recipient');
-
-    const a =
-      params.get('amount');
-
-    const m =
-      params.get('memo');
-
-    if (r) {
-      setRecipient(r);
-    }
-
-    if (a) {
-      setAmount(a);
-    }
-
-    if (m) {
-      setMemo(m);
-    }
-
-    if (
-      payParam &&
-      r &&
-      a
-    ) {
-      setIsPaymentPage(true);
-    }
-
-    loadPaymentHistory();
-  }, []);
-
-  const totalVolume =
-    payments.reduce(
-      (
-        total,
-        payment
-      ) => total + payment.amount,
-      0n
-    );
-
-  const myPayments =
-    address
-      ? payments.filter(
-          (payment) =>
-            payment.payer.toLowerCase() ===
-              address.toLowerCase() ||
-            payment.recipient.toLowerCase() ===
-              address.toLowerCase()
-        )
-      : [];
+  const myPayments = address
+    ? payments.filter(
+        (payment) =>
+          payment.payer.toLowerCase() ===
+          address.toLowerCase()
+      )
+    : [];
 
   return (
     <main className="container">
-
       <div className="badge">
         BASE MAINNET
       </div>
 
-      <h1>
-        BasePayLink
-      </h1>
+      <h1>BasePayLink</h1>
 
       <p className="subtitle">
         Simple USDC payments powered by Base.
       </p>
 
+      {/*
+       * PAYMENT REQUEST PAGE
+       */}
       {isPaymentPage ? (
-
         <section className="card payment-card">
-
-          <h2>
-            Pay Request
-          </h2>
+          <h2>Pay Request</h2>
 
           <div className="payment-summary">
-
             <div>
-              <span>
-                Amount
-              </span>
-
+              <span>Amount</span>
               <strong>
                 {amount} USDC
               </strong>
             </div>
 
             <div>
-              <span>
-                Recipient
-              </span>
-
+              <span>Recipient</span>
               <strong>
-                {shortenAddress(
+                {shortAddress(
                   recipient
                 )}
               </strong>
             </div>
 
             <div>
-              <span>
-                Memo
-              </span>
-
+              <span>Memo</span>
               <strong>
                 {memo}
               </strong>
             </div>
-
           </div>
 
           {!address && (
@@ -598,61 +584,53 @@ export default function Home() {
             </p>
           )}
 
-          {paymentSuccess &&
-            tx && (
+          {paymentSuccess && tx && (
+            <div className="success">
+              <h3>
+                ✓ Payment Successful
+              </h3>
 
-              <div className="success">
+              <p>
+                <strong>
+                  {amount} USDC
+                </strong>{' '}
+                paid successfully.
+              </p>
 
-                <h3>
-                  ✓ Payment Successful
-                </h3>
+              <p>
+                Recipient:{' '}
+                {shortAddress(
+                  recipient
+                )}
+              </p>
 
-                <p>
-                  <strong>
-                    {amount} USDC
-                  </strong>{' '}
-                  paid successfully.
-                </p>
+              <a
+                href={`https://basescan.org/tx/${tx}`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                View Transaction on BaseScan →
+              </a>
 
-                <p>
-                  Recipient:{' '}
-                  {shortenAddress(
-                    recipient
-                  )}
-                </p>
-
-                <a
-                  href={
-                    `https://basescan.org/tx/${tx}`
-                  }
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  View Transaction on BaseScan →
-                </a>
-
-                <button
-                  onClick={
-                    resetPayment
-                  }
-                >
-                  New Payment
-                </button>
-
-              </div>
-            )}
-
+              <button
+                onClick={
+                  resetPayment
+                }
+              >
+                New Payment
+              </button>
+            </div>
+          )}
         </section>
-
       ) : (
-
         <>
-
+          {/*
+           * WALLET
+           */}
           <section className="card">
-
             <button onClick={connect}>
               {address
-                ? shortenAddress(
+                ? shortAddress(
                     address
                   )
                 : 'Connect Wallet'}
@@ -663,12 +641,12 @@ export default function Home() {
                 Connected to Base Mainnet
               </p>
             )}
-
           </section>
 
-
+          {/*
+           * CREATE PAYMENT LINK
+           */}
           <section className="card">
-
             <h2>
               Create Payment Link
             </h2>
@@ -680,9 +658,9 @@ export default function Home() {
             <input
               placeholder="0x..."
               value={recipient}
-              onChange={(e) =>
+              onChange={(event) =>
                 setRecipient(
-                  e.target.value
+                  event.target.value
                 )
               }
             />
@@ -696,9 +674,9 @@ export default function Home() {
               min="0.01"
               step="0.01"
               value={amount}
-              onChange={(e) =>
+              onChange={(event) =>
                 setAmount(
-                  e.target.value
+                  event.target.value
                 )
               }
             />
@@ -709,9 +687,9 @@ export default function Home() {
 
             <input
               value={memo}
-              onChange={(e) =>
+              onChange={(event) =>
                 setMemo(
-                  e.target.value
+                  event.target.value
                 )
               }
             />
@@ -724,11 +702,8 @@ export default function Home() {
               Create Payment Link
             </button>
 
-
             {paymentLink && (
-
               <div className="status">
-
                 <p>
                   Payment link created:
                 </p>
@@ -738,21 +713,18 @@ export default function Home() {
                   value={
                     paymentLink
                   }
-                  onFocus={(e) =>
-                    e.currentTarget.select()
+                  onFocus={(event) =>
+                    event.currentTarget.select()
                   }
                 />
 
                 <button
-                  onClick={
-                    copyLink
-                  }
+                  onClick={copyLink}
                 >
                   {copied
                     ? '✓ Copied'
                     : 'Copy Link'}
                 </button>
-
 
                 <div
                   style={{
@@ -760,29 +732,54 @@ export default function Home() {
                     textAlign: 'center',
                   }}
                 >
-
-                  <QRCodeSVG
-                    value={
-                      paymentLink
-                    }
-                    size={220}
-                    level="H"
-                  />
-
                   <p>
                     <strong>
                       Scan to Pay
                     </strong>
                   </p>
 
-                  <small>
-                    Scan this QR code
-                    to open the payment
-                    request.
-                  </small>
+                  <p>
+                    Scan this QR code to
+                    open the payment request.
+                  </p>
 
+                  <QRCodeSVG
+                    value={
+                      paymentLink
+                    }
+                    size={220}
+                    level="M"
+                  />
+
+                  <div
+                    style={{
+                      marginTop: '15px',
+                    }}
+                  >
+                    <button
+                      onClick={() => {
+                        if (
+                          navigator.share
+                        ) {
+                          navigator.share(
+                            {
+                              title:
+                                'BasePayLink Payment',
+                              text:
+                                `Pay ${amount} USDC`,
+                              url:
+                                paymentLink,
+                            }
+                          );
+                        } else {
+                          copyLink();
+                        }
+                      }}
+                    >
+                      Share
+                    </button>
+                  </div>
                 </div>
-
               </div>
             )}
 
@@ -791,12 +788,12 @@ export default function Home() {
                 {status}
               </p>
             )}
-
           </section>
 
-
+          {/*
+           * DIRECT PAYMENT
+           */}
           <section className="card">
-
             <h2>
               Pay USDC
             </h2>
@@ -808,9 +805,9 @@ export default function Home() {
             <input
               placeholder="0x..."
               value={recipient}
-              onChange={(e) =>
+              onChange={(event) =>
                 setRecipient(
-                  e.target.value
+                  event.target.value
                 )
               }
             />
@@ -824,9 +821,9 @@ export default function Home() {
               min="0.01"
               step="0.01"
               value={amount}
-              onChange={(e) =>
+              onChange={(event) =>
                 setAmount(
-                  e.target.value
+                  event.target.value
                 )
               }
             />
@@ -837,9 +834,9 @@ export default function Home() {
 
             <input
               value={memo}
-              onChange={(e) =>
+              onChange={(event) =>
                 setMemo(
-                  e.target.value
+                  event.target.value
                 )
               }
             />
@@ -859,9 +856,7 @@ export default function Home() {
 
             {paymentSuccess &&
               tx && (
-
                 <div className="success">
-
                   <h3>
                     ✓ Payment Successful
                   </h3>
@@ -875,15 +870,13 @@ export default function Home() {
 
                   <p>
                     Recipient:{' '}
-                    {shortenAddress(
+                    {shortAddress(
                       recipient
                     )}
                   </p>
 
                   <a
-                    href={
-                      `https://basescan.org/tx/${tx}`
-                    }
+                    href={`https://basescan.org/tx/${tx}`}
                     target="_blank"
                     rel="noreferrer"
                   >
@@ -897,187 +890,237 @@ export default function Home() {
                   >
                     Create New Payment
                   </button>
-
                 </div>
               )}
-
           </section>
 
-
+          {/*
+           * PAYMENT HISTORY
+           */}
           <section className="card">
-
-            <h2>
-              Payment History
-            </h2>
-
             <div
-              className="history-stats"
+              style={{
+                display: 'flex',
+                justifyContent:
+                  'space-between',
+                alignItems: 'center',
+                gap: '10px',
+                flexWrap: 'wrap',
+              }}
             >
+              <h2>
+                Payment History
+              </h2>
 
-              <div>
-                <h3>
-                  {payments.length}
-                </h3>
-
-                <span>
-                  Payments
-                </span>
-              </div>
-
-              <div>
-                <h3>
-                  {formatUSDC(
-                    totalVolume
-                  )}{' '}
-                  USDC
-                </h3>
-
-                <span>
-                  Total Volume
-                </span>
-              </div>
-
-              <div>
-                <h3>
-                  {myPayments.length}
-                </h3>
-
-                <span>
-                  My Payments
-                </span>
-              </div>
-
+              <button
+                onClick={
+                  loadPaymentHistory
+                }
+                disabled={
+                  historyLoading
+                }
+              >
+                {historyLoading
+                  ? 'Loading...'
+                  : 'Refresh History'}
+              </button>
             </div>
 
-
-            <button
-              onClick={
-                loadPaymentHistory
-              }
-              disabled={
-                historyLoading
-              }
-            >
-              {historyLoading
-                ? 'Loading...'
-                : 'Refresh History'}
-            </button>
-
-
             {historyError && (
-              <p className="status">
-                {historyError}
-              </p>
+              <div className="status">
+                <p>
+                  Could not load payment
+                  history.
+                </p>
+
+                <p>
+                  {historyError}
+                </p>
+
+                <button
+                  onClick={
+                    loadPaymentHistory
+                  }
+                >
+                  Try Again
+                </button>
+              </div>
             )}
 
-
-            {!historyLoading &&
-              !historyError &&
-              payments.length === 0 && (
+            {!historyError &&
+              historyLoading && (
                 <p className="status">
-                  No payments found yet.
+                  Loading payment history...
                 </p>
               )}
 
+            {!historyError &&
+              !historyLoading &&
+              historyLoaded && (
+                <>
+                  <div
+                    className="payment-summary"
+                    style={{
+                      marginTop:
+                        '20px',
+                    }}
+                  >
+                    <div>
+                      <span>
+                        Payments
+                      </span>
 
-            {payments.length > 0 && (
-
-              <div
-                style={{
-                  marginTop: '20px',
-                }}
-              >
-
-                {payments.map(
-                  (
-                    payment,
-                    index
-                  ) => (
-
-                    <div
-                      key={
-                        `${payment.transactionHash}-${index}`
-                      }
-                      style={{
-                        border:
-                          '1px solid rgba(255,255,255,0.12)',
-                        borderRadius:
-                          '12px',
-                        padding:
-                          '16px',
-                        marginBottom:
-                          '12px',
-                      }}
-                    >
-
-                      <div
-                        style={{
-                          display:
-                            'flex',
-                          justifyContent:
-                            'space-between',
-                          gap:
-                            '12px',
-                          flexWrap:
-                            'wrap',
-                        }}
-                      >
-
-                        <strong>
-                          {formatUSDC(
-                            payment.amount
-                          )}{' '}
-                          USDC
-                        </strong>
-
-                        <span>
-                          {payment.memo}
-                        </span>
-
-                      </div>
-
-                      <p>
-                        <strong>
-                          From:
-                        </strong>{' '}
-                        {shortenAddress(
-                          payment.payer
-                        )}
-                      </p>
-
-                      <p>
-                        <strong>
-                          To:
-                        </strong>{' '}
-                        {shortenAddress(
-                          payment.recipient
-                        )}
-                      </p>
-
-                      <a
-                        href={
-                          `https://basescan.org/tx/${payment.transactionHash}`
-                        }
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        View Transaction →
-                      </a>
-
+                      <strong>
+                        {payments.length}
+                      </strong>
                     </div>
 
-                  )
-                )}
+                    <div>
+                      <span>
+                        Total Volume
+                      </span>
 
-              </div>
-            )}
+                      <strong>
+                        {formatUnits(
+                          totalVolume,
+                          6
+                        )}{' '}
+                        USDC
+                      </strong>
+                    </div>
 
+                    <div>
+                      <span>
+                        My Payments
+                      </span>
+
+                      <strong>
+                        {myPayments.length}
+                      </strong>
+                    </div>
+                  </div>
+
+                  {payments.length ===
+                  0 ? (
+                    <div
+                      className="status"
+                      style={{
+                        marginTop:
+                          '20px',
+                      }}
+                    >
+                      <p>
+                        No payments found
+                        yet.
+                      </p>
+
+                      <p>
+                        Payments made
+                        through this
+                        BasePayLink contract
+                        will appear here.
+                      </p>
+                    </div>
+                  ) : (
+                    <div
+                      style={{
+                        marginTop:
+                          '20px',
+                      }}
+                    >
+                      {payments.map(
+                        (
+                          payment,
+                          index
+                        ) => (
+                          <div
+                            key={`${payment.txHash}-${index}`}
+                            className="payment-summary"
+                            style={{
+                              marginBottom:
+                                '15px',
+                              padding:
+                                '15px',
+                              border:
+                                '1px solid rgba(255,255,255,0.1)',
+                              borderRadius:
+                                '12px',
+                            }}
+                          >
+                            <div>
+                              <span>
+                                Amount
+                              </span>
+
+                              <strong>
+                                {formatUnits(
+                                  payment.amount,
+                                  6
+                                )}{' '}
+                                USDC
+                              </strong>
+                            </div>
+
+                            <div>
+                              <span>
+                                Payer
+                              </span>
+
+                              <strong>
+                                {shortAddress(
+                                  payment.payer
+                                )}
+                              </strong>
+                            </div>
+
+                            <div>
+                              <span>
+                                Recipient
+                              </span>
+
+                              <strong>
+                                {shortAddress(
+                                  payment.recipient
+                                )}
+                              </strong>
+                            </div>
+
+                            <div>
+                              <span>
+                                Memo
+                              </span>
+
+                              <strong>
+                                {payment.memo ||
+                                  '—'}
+                              </strong>
+                            </div>
+
+                            <div>
+                              <span>
+                                Transaction
+                              </span>
+
+                              <strong>
+                                <a
+                                  href={`https://basescan.org/tx/${payment.txHash}`}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  View on BaseScan →
+                                </a>
+                              </strong>
+                            </div>
+                          </div>
+                        )
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
           </section>
-
         </>
-
       )}
-
     </main>
   );
 }
