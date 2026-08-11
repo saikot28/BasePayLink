@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   createPublicClient,
   createWalletClient,
@@ -11,23 +11,21 @@ import {
   keccak256,
   stringToBytes,
   getAddress,
-  type Address,
 } from 'viem';
+import type { Address, Hex } from 'viem';
 import { base } from 'viem/chains';
 import { QRCodeSVG } from 'qrcode.react';
 
-const USDC =
-  '0x833589fCD6eDb6E08f4c7C32d4f71b54bdA02913' as Address;
+const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as Address;
 
-const PAYMENT_CONTRACT =
-  (process.env.NEXT_PUBLIC_PAYMENT_CONTRACT ||
-    '0x0650a97C4d0a130E8aEa7852fA780B97fED5888C') as Address;
-
-const BASE_RPC = 'https://mainnet.base.org';
+const PAYMENT_CONTRACT = (
+  process.env.NEXT_PUBLIC_PAYMENT_CONTRACT ||
+  '0x0650a97C4d0a130E8aEa7852fA780B97fED5888C'
+) as Address;
 
 const publicClient = createPublicClient({
   chain: base,
-  transport: http(BASE_RPC),
+  transport: http('https://mainnet.base.org'),
 });
 
 const erc20Abi = [
@@ -90,13 +88,15 @@ const paymentEvent = {
   ],
 } as const;
 
+const paymentEventAbi = [paymentEvent] as const;
+
 type PaymentItem = {
-  linkId: `0x${string}`;
+  linkId: Hex;
   payer: Address;
   recipient: Address;
   amount: bigint;
   memo: string;
-  txHash: `0x${string}`;
+  txHash: Hex;
   blockNumber: bigint;
 };
 
@@ -115,7 +115,7 @@ function makeLinkId(
   recipient: string,
   amount: string,
   memo: string
-): `0x${string}` {
+): Hex {
   return keccak256(
     stringToBytes(
       `${recipient.toLowerCase()}-${amount}-${memo}`
@@ -123,7 +123,7 @@ function makeLinkId(
   );
 }
 
-function shortAddress(address: string) {
+function shortAddress(address: string): string {
   if (!address) return '';
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
@@ -140,13 +140,13 @@ export default function Home() {
 
   const [paymentLink, setPaymentLink] = useState('');
   const [paymentSuccess, setPaymentSuccess] = useState(false);
-
   const [isPaymentPage, setIsPaymentPage] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const [payments, setPayments] = useState<PaymentItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState('');
+  const [historyLoaded, setHistoryLoaded] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -213,7 +213,11 @@ export default function Home() {
     }
 
     try {
-      const linkId = makeLinkId(recipient, amount, memo);
+      const linkId = makeLinkId(
+        recipient,
+        amount,
+        memo
+      );
 
       const url =
         `${window.location.origin}/?pay=${linkId}` +
@@ -243,10 +247,6 @@ export default function Home() {
     }
   };
 
-  /*
-   * Load history in chunks of <= 10,000 blocks.
-   * This avoids Base RPC eth_getLogs range errors.
-   */
   const loadPaymentHistory = async () => {
     setHistoryLoading(true);
     setHistoryError('');
@@ -254,34 +254,40 @@ export default function Home() {
     try {
       const latestBlock = await publicClient.getBlockNumber();
 
-      const CHUNK_SIZE = 10_000n;
-      const SEARCH_BLOCKS = 3_000_000n;
+      /*
+       * Base RPC eth_getLogs allows a maximum 10,000 block range.
+       * We therefore split the search into chunks.
+       */
+      const CHUNK_SIZE = 9_000n;
+      const SEARCH_BLOCKS = 300_000n;
 
       const startBlock =
         latestBlock > SEARCH_BLOCKS
           ? latestBlock - SEARCH_BLOCKS
           : 0n;
 
-      const allLogs: Awaited<
-        ReturnType<typeof publicClient.getLogs<typeof paymentEvent>>
-      > = [];
+      const allLogs: any[] = [];
 
       let fromBlock = startBlock;
 
       while (fromBlock <= latestBlock) {
         const toBlock =
-          fromBlock + CHUNK_SIZE - 1n > latestBlock
+          fromBlock + CHUNK_SIZE > latestBlock
             ? latestBlock
-            : fromBlock + CHUNK_SIZE - 1n;
+            : fromBlock + CHUNK_SIZE;
 
         const logs = await publicClient.getLogs({
           address: PAYMENT_CONTRACT,
-          event: paymentEvent,
+          events: paymentEventAbi,
           fromBlock,
           toBlock,
         });
 
         allLogs.push(...logs);
+
+        if (toBlock >= latestBlock) {
+          break;
+        }
 
         fromBlock = toBlock + 1n;
       }
@@ -289,16 +295,28 @@ export default function Home() {
       const items: PaymentItem[] = [];
 
       for (const log of allLogs) {
-        const payer = log.args.payer;
-        const recipient = log.args.recipient;
-        const amount = log.args.amount;
-        const linkId = log.args.linkId;
-        const memo = log.args.memo;
+        /*
+         * Viem's inferred log type can vary depending on ABI inference.
+         * We safely read args through a local cast.
+         */
+        const args = (log as any).args;
+
+        if (!args) {
+          continue;
+        }
+
+        const payer = args.payer as Address | undefined;
+        const logRecipient =
+          args.recipient as Address | undefined;
+        const logAmount =
+          args.amount as bigint | undefined;
+        const linkId = args.linkId as Hex | undefined;
+        const logMemo = args.memo as string | undefined;
 
         if (
           !payer ||
-          !recipient ||
-          amount === undefined ||
+          !logRecipient ||
+          logAmount === undefined ||
           !linkId ||
           !log.transactionHash
         ) {
@@ -308,9 +326,9 @@ export default function Home() {
         items.push({
           linkId,
           payer,
-          recipient,
-          amount,
-          memo: memo || '',
+          recipient: logRecipient,
+          amount: logAmount,
+          memo: logMemo || '',
           txHash: log.transactionHash,
           blockNumber: log.blockNumber || 0n,
         });
@@ -323,6 +341,7 @@ export default function Home() {
       });
 
       setPayments(items);
+      setHistoryLoaded(true);
     } catch (error) {
       console.error('Payment history error:', error);
 
@@ -384,16 +403,12 @@ export default function Home() {
         'Step 1/2: Approve USDC in your wallet...'
       );
 
-      const approveHash = await wallet.writeContract({
+      await wallet.writeContract({
         address: USDC,
         abi: erc20Abi,
         functionName: 'approve',
         args: [PAYMENT_CONTRACT, value],
         account: address,
-      });
-
-      await publicClient.waitForTransactionReceipt({
-        hash: approveHash,
       });
 
       setStatus(
@@ -413,17 +428,13 @@ export default function Home() {
         account: address,
       });
 
-      await publicClient.waitForTransactionReceipt({
-        hash,
-      });
-
       setTx(hash);
       setPaymentSuccess(true);
       setStatus('');
 
       setTimeout(() => {
         loadPaymentHistory();
-      }, 3000);
+      }, 5000);
     } catch (error) {
       setPaymentSuccess(false);
 
@@ -441,83 +452,75 @@ export default function Home() {
     setStatus('');
   };
 
-  const totalVolume = useMemo(() => {
-    return payments.reduce(
-      (total, payment) => total + payment.amount,
-      0n
-    );
-  }, [payments]);
+  const totalVolume = payments.reduce(
+    (total, payment) => total + payment.amount,
+    0n
+  );
 
-  const myPayments = useMemo(() => {
-    if (!address) return [];
+  const myPayments = address
+    ? payments.filter(
+        (payment) =>
+          payment.payer.toLowerCase() ===
+          address.toLowerCase()
+      )
+    : [];
 
-    return payments.filter(
-      (payment) =>
-        payment.payer.toLowerCase() ===
-        address.toLowerCase()
-    );
-  }, [payments, address]);
+  return (
+    <main className="container">
+      <div className="badge">BASE MAINNET</div>
 
-  /*
-   * Payment request page
-   */
-  if (isPaymentPage) {
-    return (
-      <main className="app-shell">
-        <div className="top-badge">BASE MAINNET</div>
+      <h1>BasePayLink</h1>
 
-        <header className="hero">
-          <h1>BasePayLink</h1>
-          <p>Simple USDC payments powered by Base.</p>
-        </header>
+      <p className="subtitle">
+        Simple USDC payments powered by Base.
+      </p>
 
-        <section className="card payment-request">
-          <div className="section-title">
+      {isPaymentPage ? (
+        <section className="card payment-card">
+          <div className="section-number">PAY REQUEST</div>
+
+          <h2>Pay Request</h2>
+
+          <div className="payment-summary">
             <div>
-              <span className="eyebrow">PAYMENT REQUEST</span>
-              <h2>Pay Request</h2>
-            </div>
-          </div>
-
-          <div className="request-grid">
-            <div className="request-item">
               <span>Amount</span>
               <strong>{amount} USDC</strong>
             </div>
 
-            <div className="request-item">
+            <div>
               <span>Recipient</span>
               <strong>{shortAddress(recipient)}</strong>
             </div>
 
-            <div className="request-item full">
+            <div>
               <span>Memo</span>
               <strong>{memo}</strong>
             </div>
           </div>
 
           {!address && (
-            <button className="primary-btn" onClick={connect}>
+            <button onClick={connect}>
               Connect Wallet
             </button>
           )}
 
           {address && !paymentSuccess && (
-            <button className="primary-btn" onClick={pay}>
+            <button onClick={pay}>
               Pay {amount} USDC
             </button>
           )}
 
-          {status && <div className="notice">{status}</div>}
+          {status && (
+            <p className="status">{status}</p>
+          )}
 
           {paymentSuccess && tx && (
-            <div className="success-box">
-              <div className="success-icon">✓</div>
-
-              <h3>Payment Successful</h3>
+            <div className="success">
+              <h3>✓ Payment Successful</h3>
 
               <p>
-                {amount} USDC paid successfully.
+                <strong>{amount} USDC</strong>{' '}
+                paid successfully.
               </p>
 
               <p>
@@ -528,80 +531,49 @@ export default function Home() {
                 href={`https://basescan.org/tx/${tx}`}
                 target="_blank"
                 rel="noreferrer"
-                className="tx-link"
               >
                 View Transaction on BaseScan →
               </a>
 
-              <button
-                className="secondary-btn"
-                onClick={resetPayment}
-              >
+              <button onClick={resetPayment}>
                 New Payment
               </button>
             </div>
           )}
         </section>
-      </main>
-    );
-  }
+      ) : (
+        <>
+          {/* WALLET */}
+          <section className="card">
+            <div className="section-number">01</div>
+            <div className="section-label">WALLET</div>
 
-  return (
-    <main className="app-shell">
-      <div className="top-badge">BASE MAINNET</div>
+            <h2>Connect Wallet</h2>
 
-      <header className="hero">
-        <h1>BasePayLink</h1>
-        <p>Simple USDC payments powered by Base.</p>
-      </header>
+            <button onClick={connect}>
+              {address
+                ? shortAddress(address)
+                : 'Connect Wallet'}
+            </button>
 
-      {/* WALLET */}
-      <section className="card">
-        <div className="section-title">
-          <div>
-            <span className="step">01</span>
-            <div>
-              <span className="eyebrow">WALLET</span>
-              <h2>Connect Wallet</h2>
+            {address && (
+              <p className="status">
+                Connected to Base Mainnet
+              </p>
+            )}
+          </section>
+
+          {/* CREATE PAYMENT LINK */}
+          <section className="card">
+            <div className="section-number">02</div>
+            <div className="section-label">
+              PAYMENT LINK
             </div>
-          </div>
 
-          <button className="primary-btn compact" onClick={connect}>
-            {address
-              ? shortAddress(address)
-              : 'Connect Wallet'}
-          </button>
-        </div>
+            <h2>Create Payment Link</h2>
 
-        {address && (
-          <div className="connected">
-            <span className="dot" />
-            Connected to Base Mainnet
-          </div>
-        )}
-
-        {status && !paymentLink && (
-          <div className="notice">{status}</div>
-        )}
-      </section>
-
-      {/* CREATE PAYMENT LINK */}
-      <section className="card">
-        <div className="section-title">
-          <div>
-            <span className="step">02</span>
-            <div>
-              <span className="eyebrow">
-                PAYMENT LINK
-              </span>
-              <h2>Create Payment Link</h2>
-            </div>
-          </div>
-        </div>
-
-        <div className="form-grid">
-          <div className="field">
             <label>Recipient</label>
+
             <input
               placeholder="0x..."
               value={recipient}
@@ -609,122 +581,103 @@ export default function Home() {
                 setRecipient(event.target.value)
               }
             />
-          </div>
 
-          <div className="field">
             <label>Amount (USDC)</label>
+
             <input
               type="number"
-              min="0.000001"
+              min="0.01"
               step="0.01"
               value={amount}
               onChange={(event) =>
                 setAmount(event.target.value)
               }
             />
-          </div>
 
-          <div className="field full">
             <label>Memo</label>
+
             <input
               value={memo}
               onChange={(event) =>
                 setMemo(event.target.value)
               }
             />
-          </div>
-        </div>
 
-        <button
-          className="primary-btn"
-          onClick={createPaymentLink}
-        >
-          Create Payment Link
-        </button>
+            <button onClick={createPaymentLink}>
+              Create Payment Link
+            </button>
 
-        {paymentLink && (
-          <div className="link-result">
-            <div className="link-header">
-              <div>
-                <span className="eyebrow">
-                  PAYMENT LINK READY
-                </span>
-                <h3>Share this payment request</h3>
-              </div>
+            {paymentLink && (
+              <div className="link-result">
+                <p className="result-title">
+                  Payment link created
+                </p>
 
-              <span className="ready-badge">
-                READY
-              </span>
-            </div>
-
-            <input
-              className="link-input"
-              readOnly
-              value={paymentLink}
-              onFocus={(event) =>
-                event.currentTarget.select()
-              }
-            />
-
-            <div className="link-actions">
-              <button
-                className="secondary-btn"
-                onClick={copyLink}
-              >
-                {copied ? '✓ Copied' : 'Copy Link'}
-              </button>
-
-              <button
-                className="secondary-btn"
-                onClick={() => {
-                  if (navigator.share) {
-                    navigator.share({
-                      title: 'BasePayLink Payment',
-                      text: `Pay ${amount} USDC`,
-                      url: paymentLink,
-                    });
-                  } else {
-                    copyLink();
+                <input
+                  readOnly
+                  value={paymentLink}
+                  onFocus={(event) =>
+                    event.currentTarget.select()
                   }
-                }}
-              >
-                Share
-              </button>
+                />
+
+                <div className="button-row">
+                  <button onClick={copyLink}>
+                    {copied ? '✓ Copied' : 'Copy Link'}
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      if (navigator.share) {
+                        navigator.share({
+                          title:
+                            'BasePayLink Payment',
+                          text:
+                            `Pay ${amount} USDC`,
+                          url: paymentLink,
+                        });
+                      } else {
+                        copyLink();
+                      }
+                    }}
+                  >
+                    Share
+                  </button>
+                </div>
+
+                <div className="qr-box">
+                  <strong>Scan to Pay</strong>
+
+                  <p>
+                    Scan this QR code to open the
+                    payment request.
+                  </p>
+
+                  <QRCodeSVG
+                    value={paymentLink}
+                    size={220}
+                    level="M"
+                  />
+                </div>
+              </div>
+            )}
+
+            {status && (
+              <p className="status">{status}</p>
+            )}
+          </section>
+
+          {/* DIRECT PAYMENT */}
+          <section className="card">
+            <div className="section-number">03</div>
+            <div className="section-label">
+              USDC PAYMENT
             </div>
 
-            <div className="qr-box">
-              <QRCodeSVG
-                value={paymentLink}
-                size={200}
-                level="M"
-              />
-              <p>Scan to open payment request</p>
-            </div>
-          </div>
-        )}
+            <h2>Pay USDC</h2>
 
-        {status && paymentLink && (
-          <div className="notice">{status}</div>
-        )}
-      </section>
-
-      {/* DIRECT PAYMENT */}
-      <section className="card">
-        <div className="section-title">
-          <div>
-            <span className="step">03</span>
-            <div>
-              <span className="eyebrow">
-                USDC PAYMENT
-              </span>
-              <h2>Pay USDC</h2>
-            </div>
-          </div>
-        </div>
-
-        <div className="form-grid">
-          <div className="field">
             <label>Recipient</label>
+
             <input
               placeholder="0x..."
               value={recipient}
@@ -732,230 +685,217 @@ export default function Home() {
                 setRecipient(event.target.value)
               }
             />
-          </div>
 
-          <div className="field">
             <label>Amount (USDC)</label>
+
             <input
               type="number"
-              min="0.000001"
+              min="0.01"
               step="0.01"
               value={amount}
               onChange={(event) =>
                 setAmount(event.target.value)
               }
             />
-          </div>
 
-          <div className="field full">
             <label>Memo</label>
+
             <input
               value={memo}
               onChange={(event) =>
                 setMemo(event.target.value)
               }
             />
-          </div>
-        </div>
-
-        <button
-          className="primary-btn"
-          disabled={!address}
-          onClick={pay}
-        >
-          {address
-            ? `Pay ${amount} USDC`
-            : 'Connect Wallet First'}
-        </button>
-
-        {status && !paymentLink && (
-          <div className="notice">{status}</div>
-        )}
-
-        {paymentSuccess && tx && (
-          <div className="success-box">
-            <div className="success-icon">✓</div>
-
-            <h3>Payment Successful</h3>
-
-            <p>
-              {amount} USDC paid successfully.
-            </p>
-
-            <a
-              href={`https://basescan.org/tx/${tx}`}
-              target="_blank"
-              rel="noreferrer"
-              className="tx-link"
-            >
-              View Transaction on BaseScan →
-            </a>
 
             <button
-              className="secondary-btn"
-              onClick={resetPayment}
+              disabled={!address}
+              onClick={pay}
             >
-              Create New Payment
+              {address
+                ? 'Pay USDC'
+                : 'Connect Wallet First'}
             </button>
-          </div>
-        )}
-      </section>
 
-      {/* PAYMENT HISTORY */}
-      <section className="card history-card">
-        <div className="section-title">
-          <div>
-            <span className="step">04</span>
-            <div>
-              <span className="eyebrow">
-                ACTIVITY
-              </span>
-              <h2>Payment History</h2>
-            </div>
-          </div>
+            {status && (
+              <p className="status">{status}</p>
+            )}
 
-          <button
-            className="secondary-btn compact"
-            onClick={loadPaymentHistory}
-            disabled={historyLoading}
-          >
-            {historyLoading
-              ? 'Loading...'
-              : 'Refresh History'}
-          </button>
-        </div>
+            {paymentSuccess && tx && (
+              <div className="success">
+                <h3>✓ Payment Successful</h3>
 
-        {historyError && (
-          <div className="error-box">
-            <strong>
-              Could not load payment history.
-            </strong>
+                <p>
+                  <strong>{amount} USDC</strong>{' '}
+                  paid successfully.
+                </p>
 
-            <p>{historyError}</p>
+                <p>
+                  Recipient:{' '}
+                  {shortAddress(recipient)}
+                </p>
 
-            <button
-              className="secondary-btn"
-              onClick={loadPaymentHistory}
-            >
-              Try Again
-            </button>
-          </div>
-        )}
+                <a
+                  href={`https://basescan.org/tx/${tx}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  View Transaction on BaseScan →
+                </a>
 
-        {!historyError && historyLoading && (
-          <div className="empty-state">
-            Loading payment history...
-          </div>
-        )}
+                <button onClick={resetPayment}>
+                  Create New Payment
+                </button>
+              </div>
+            )}
+          </section>
 
-        {!historyError &&
-          !historyLoading && (
-            <>
-              <div className="stats-grid">
-                <div className="stat">
-                  <span>Payments</span>
-                  <strong>{payments.length}</strong>
+          {/* PAYMENT HISTORY */}
+          <section className="card history-card">
+            <div className="history-header">
+              <div>
+                <div className="section-number">04</div>
+                <div className="section-label">
+                  ACTIVITY
                 </div>
-
-                <div className="stat">
-                  <span>Total Volume</span>
-                  <strong>
-                    {formatUnits(
-                      totalVolume,
-                      6
-                    )}{' '}
-                    USDC
-                  </strong>
-                </div>
-
-                <div className="stat">
-                  <span>My Payments</span>
-                  <strong>
-                    {myPayments.length}
-                  </strong>
-                </div>
+                <h2>Payment History</h2>
               </div>
 
-              {payments.length === 0 ? (
-                <div className="empty-state">
-                  <div className="empty-icon">↔</div>
-                  <h3>No payments yet</h3>
-                  <p>
-                    Payments made through the
-                    BasePayLink contract will
-                    appear here.
-                  </p>
-                </div>
-              ) : (
-                <div className="table-wrap">
-                  <table className="payment-table">
-                    <thead>
-                      <tr>
-                        <th>Amount</th>
-                        <th>Payer</th>
-                        <th>Recipient</th>
-                        <th>Memo</th>
-                        <th>Transaction</th>
-                      </tr>
-                    </thead>
+              <button
+                onClick={loadPaymentHistory}
+                disabled={historyLoading}
+              >
+                {historyLoading
+                  ? 'Loading...'
+                  : 'Refresh History'}
+              </button>
+            </div>
 
-                    <tbody>
-                      {payments.map(
-                        (payment, index) => (
-                          <tr
-                            key={`${payment.txHash}-${index}`}
-                          >
-                            <td>
-                              <strong>
-                                {formatUnits(
-                                  payment.amount,
-                                  6
-                                )}{' '}
-                                USDC
-                              </strong>
-                            </td>
+            {historyError && (
+              <div className="error-box">
+                <strong>
+                  Could not load payment history.
+                </strong>
 
-                            <td>
-                              {shortAddress(
-                                payment.payer
-                              )}
-                            </td>
+                <p>{historyError}</p>
 
-                            <td>
-                              {shortAddress(
-                                payment.recipient
-                              )}
-                            </td>
+                <button onClick={loadPaymentHistory}>
+                  Try Again
+                </button>
+              </div>
+            )}
 
-                            <td>
-                              {payment.memo || '—'}
-                            </td>
-
-                            <td>
-                              <a
-                                href={`https://basescan.org/tx/${payment.txHash}`}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="tx-link"
-                              >
-                                View →
-                              </a>
-                            </td>
-                          </tr>
-                        )
-                      )}
-                    </tbody>
-                  </table>
+            {!historyError &&
+              historyLoading && (
+                <div className="loading-box">
+                  Loading payment history...
                 </div>
               )}
-            </>
-          )}
-      </section>
 
-      <footer>
-        <span>BasePayLink</span>
-        <span>USDC • Base Mainnet</span>
-      </footer>
+            {!historyError &&
+              !historyLoading &&
+              historyLoaded && (
+                <>
+                  <div className="stats-grid">
+                    <div className="stat">
+                      <span>Payments</span>
+                      <strong>{payments.length}</strong>
+                    </div>
+
+                    <div className="stat">
+                      <span>Total Volume</span>
+                      <strong>
+                        {formatUnits(
+                          totalVolume,
+                          6
+                        )}{' '}
+                        USDC
+                      </strong>
+                    </div>
+
+                    <div className="stat">
+                      <span>My Payments</span>
+                      <strong>
+                        {myPayments.length}
+                      </strong>
+                    </div>
+                  </div>
+
+                  {payments.length === 0 ? (
+                    <div className="empty-box">
+                      <h3>No payments yet</h3>
+
+                      <p>
+                        Payments made through this
+                        BasePayLink contract will
+                        appear here.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="table-wrapper">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Amount</th>
+                            <th>Payer</th>
+                            <th>Recipient</th>
+                            <th>Memo</th>
+                            <th>Transaction</th>
+                          </tr>
+                        </thead>
+
+                        <tbody>
+                          {payments.map(
+                            (payment, index) => (
+                              <tr
+                                key={`${payment.txHash}-${index}`}
+                              >
+                                <td>
+                                  <strong>
+                                    {formatUnits(
+                                      payment.amount,
+                                      6
+                                    )}{' '}
+                                    USDC
+                                  </strong>
+                                </td>
+
+                                <td>
+                                  {shortAddress(
+                                    payment.payer
+                                  )}
+                                </td>
+
+                                <td>
+                                  {shortAddress(
+                                    payment.recipient
+                                  )}
+                                </td>
+
+                                <td>
+                                  {payment.memo || '—'}
+                                </td>
+
+                                <td>
+                                  <a
+                                    href={`https://basescan.org/tx/${payment.txHash}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                  >
+                                    View on BaseScan →
+                                  </a>
+                                </td>
+                              </tr>
+                            )
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              )}
+          </section>
+        </>
+      )}
     </main>
   );
 }
