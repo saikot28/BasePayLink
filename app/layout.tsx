@@ -5,7 +5,7 @@ export const metadata: Metadata = {
   title: 'BasePayLink',
   description: 'Simple USDC payments powered by Base.',
   other: {
-    'base:app_id': '6a7b3054574e6338062940dd',
+    'base:app_id': '6a7b305457e6338062940dd',
   },
 };
 
