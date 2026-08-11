@@ -1,3 +1,22 @@
-import "./globals.css";
-export const metadata={title:"BasePayLink",description:"Simple USDC payment links powered by Base"};
-export default function RootLayout({children}:{children:React.ReactNode}){return <html lang="en"><body>{children}</body></html>}
+import type { Metadata } from 'next';
+import './globals.css';
+
+export const metadata: Metadata = {
+  title: 'BasePayLink',
+  description: 'Simple USDC payments powered by Base.',
+  other: {
+    'base:app_id': '6a7b3054574e6338062940dd',
+  },
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  );
+}
