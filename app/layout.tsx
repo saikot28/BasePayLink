@@ -1,11 +1,11 @@
-import type { Metadata } from 'next';
-import './globals.css';
+import type { Metadata } from "next";
+import "./globals.css";
 
 export const metadata: Metadata = {
-  title: 'BasePayLink',
-  description: 'Simple USDC payments powered by Base.',
+  title: "BasePayLink",
+  description: "Simple USDC payments powered by Base",
   other: {
-    'base:app_id': '6a7b305457e6338062940dd',
+    "base:app_id": "6a7b3054547e6338062940dd",
   },
 };
 
