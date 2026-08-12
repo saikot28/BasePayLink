@@ -12,10 +12,15 @@ import {
   stringToBytes,
   formatUnits,
   getAddress,
+  decodeEventLog,
 } from 'viem';
 import { base } from 'viem/chains';
 import { QRCodeSVG } from 'qrcode.react';
 import { Attribution } from 'ox/erc8021';
+
+/* =========================================================
+   CONFIG
+========================================================= */
 
 const USDC =
   '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as Address;
@@ -26,6 +31,9 @@ const PAYMENT_CONTRACT =
 
 /*
  * Base Builder Code
+ *
+ * Your Builder Code:
+ * bc_0i1qmqg3
  */
 const BUILDER_CODE = 'bc_0i1qmqg3';
 
@@ -33,14 +41,28 @@ const DATA_SUFFIX = Attribution.toDataSuffix({
   codes: [BUILDER_CODE],
 });
 
+/*
+ * For production, you can put your own RPC in .env.local:
+ *
+ * NEXT_PUBLIC_BASE_RPC_URL=https://your-rpc-url
+ *
+ * PublicNode is used as the default instead of
+ * mainnet.base.org because the latter was rate-limiting
+ * your eth_getLogs requests.
+ */
+const RPC_URL =
+  process.env.NEXT_PUBLIC_BASE_RPC_URL ||
+  'https://base-rpc.publicnode.com';
+
 const publicClient = createPublicClient({
   chain: base,
-  transport: http('https://mainnet.base.org'),
+  transport: http(RPC_URL),
 });
 
-/*
- * ERC20 ABI
- */
+/* =========================================================
+   ABI
+========================================================= */
+
 const erc20Abi = [
   {
     type: 'function',
@@ -64,9 +86,6 @@ const erc20Abi = [
   },
 ] as const;
 
-/*
- * Payment contract ABI
- */
 const paymentAbi = [
   {
     type: 'function',
@@ -94,9 +113,6 @@ const paymentAbi = [
   },
 ] as const;
 
-/*
- * Payment event
- */
 const paymentEvent = {
   type: 'event',
   name: 'Payment',
@@ -129,16 +145,21 @@ const paymentEvent = {
   ],
 } as const;
 
-/*
- * Payment history item
- */
+const paymentEventAbi = [paymentEvent] as const;
+
+/* =========================================================
+   TYPES
+========================================================= */
+
+type HexString = `0x${string}`;
+
 type PaymentItem = {
-  linkId: `0x${string}`;
+  linkId: HexString;
   payer: Address;
   recipient: Address;
   amount: bigint;
   memo: string;
-  txHash: `0x${string}`;
+  txHash: HexString;
   blockNumber: bigint;
 };
 
@@ -153,14 +174,15 @@ declare global {
   }
 }
 
-/*
- * Create deterministic payment link ID
- */
+/* =========================================================
+   HELPERS
+========================================================= */
+
 function makeLinkId(
   recipient: string,
   amount: string,
   memo: string
-): `0x${string}` {
+): HexString {
   return keccak256(
     stringToBytes(
       `${recipient.toLowerCase()}-${amount}-${memo}`
@@ -168,47 +190,77 @@ function makeLinkId(
   );
 }
 
-/*
- * Shorten address
- */
-function shortAddress(address: string): string {
-  if (!address) {
-    return '';
-  }
+function shortAddress(address: string) {
+  if (!address) return '';
 
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
+function isValidAddress(address: string) {
+  return /^0x[a-fA-F0-9]{40}$/.test(address);
+}
+
+function isValidAmount(amount: string) {
+  try {
+    const value = parseUnits(amount, 6);
+    return value > 0n;
+  } catch {
+    return false;
+  }
+}
+
+/* =========================================================
+   HOME
+========================================================= */
+
 export default function Home() {
-  const [address, setAddress] =
-    useState<Address>();
+  /* -------------------------------------------------------
+     Wallet
+  ------------------------------------------------------- */
 
-  const [amount, setAmount] =
-    useState('1');
+  const [address, setAddress] = useState<Address>();
 
-  const [recipient, setRecipient] =
-    useState('');
+  /* -------------------------------------------------------
+     Payment form
+  ------------------------------------------------------- */
 
-  const [memo, setMemo] =
-    useState('BasePayLink payment');
+  const [recipient, setRecipient] = useState('');
+  const [amount, setAmount] = useState('1');
+  const [memo, setMemo] = useState(
+    'BasePayLink payment'
+  );
 
-  const [status, setStatus] =
-    useState('');
+  /* -------------------------------------------------------
+     Status
+  ------------------------------------------------------- */
 
-  const [tx, setTx] =
-    useState('');
+  const [status, setStatus] = useState('');
+  const [tx, setTx] = useState('');
 
-  const [paymentLink, setPaymentLink] =
-    useState('');
+  /* -------------------------------------------------------
+     Payment link
+  ------------------------------------------------------- */
+
+  const [paymentLink, setPaymentLink] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  /* -------------------------------------------------------
+     Payment success
+  ------------------------------------------------------- */
 
   const [paymentSuccess, setPaymentSuccess] =
     useState(false);
 
+  /* -------------------------------------------------------
+     Payment request page
+  ------------------------------------------------------- */
+
   const [isPaymentPage, setIsPaymentPage] =
     useState(false);
 
-  const [copied, setCopied] =
-    useState(false);
+  /* -------------------------------------------------------
+     History
+  ------------------------------------------------------- */
 
   const [payments, setPayments] =
     useState<PaymentItem[]>([]);
@@ -222,9 +274,10 @@ export default function Home() {
   const [historyLoaded, setHistoryLoaded] =
     useState(false);
 
-  /*
-   * Read payment request from URL
-   */
+  /* =======================================================
+     URL PAYMENT REQUEST
+  ======================================================= */
+
   useEffect(() => {
     const params = new URLSearchParams(
       window.location.search
@@ -252,27 +305,70 @@ export default function Home() {
     }
   }, []);
 
-  /*
-   * Connect wallet
-   */
+  /* =======================================================
+     CONNECT WALLET
+  ======================================================= */
+
   const connect = async () => {
     if (!window.ethereum) {
       setStatus(
         'No browser wallet found. Install MetaMask or another compatible wallet.'
       );
+
       return;
     }
 
     try {
-      await window.ethereum.request({
-        method: 'wallet_switchEthereumChain',
-        params: [
-          {
-            chainId: '0x2105',
-          },
-        ],
-      });
+      /*
+       * Switch to Base Mainnet
+       */
+      try {
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [
+            {
+              chainId: '0x2105',
+            },
+          ],
+        });
+      } catch (switchError) {
+        console.error(
+          'Network switch error:',
+          switchError
+        );
 
+        /*
+         * If Base is not added to wallet, try adding it.
+         */
+        try {
+          await window.ethereum.request({
+            method: 'wallet_addEthereumChain',
+            params: [
+              {
+                chainId: '0x2105',
+                chainName: 'Base',
+                nativeCurrency: {
+                  name: 'Ether',
+                  symbol: 'ETH',
+                  decimals: 18,
+                },
+                rpcUrls: [
+                  'https://mainnet.base.org',
+                ],
+                blockExplorerUrls: [
+                  'https://basescan.org',
+                ],
+              },
+            ],
+          });
+        } catch {
+          throw switchError;
+        }
+      }
+
+      /*
+       * Request account
+       */
       const accounts =
         (await window.ethereum.request({
           method: 'eth_requestAccounts',
@@ -282,17 +378,21 @@ export default function Home() {
         setStatus(
           'No wallet account found.'
         );
+
         return;
       }
 
-      setAddress(
-        getAddress(accounts[0])
-      );
+      const connected =
+        getAddress(accounts[0]);
+
+      setAddress(connected);
 
       setStatus(
         'Wallet connected to Base Mainnet.'
       );
     } catch (error) {
+      console.error(error);
+
       setStatus(
         error instanceof Error
           ? error.message
@@ -301,71 +401,64 @@ export default function Home() {
     }
   };
 
-  /*
-   * Create payment link
-   */
+  /* =======================================================
+     CREATE PAYMENT LINK
+  ======================================================= */
+
   const createPaymentLink = () => {
-    if (
-      !/^0x[a-fA-F0-9]{40}$/.test(
-        recipient
-      )
-    ) {
+    setStatus('');
+
+    if (!isValidAddress(recipient)) {
       setStatus(
         'Enter a valid recipient address.'
       );
+
       return;
     }
 
-    const numericAmount =
-      Number(amount);
-
-    if (
-      !Number.isFinite(
-        numericAmount
-      ) ||
-      numericAmount <= 0
-    ) {
+    if (!isValidAmount(amount)) {
       setStatus(
-        'Enter a valid amount.'
+        'Enter a valid USDC amount.'
       );
+
       return;
     }
 
     try {
-      const linkId =
-        makeLinkId(
-          recipient,
-          amount,
-          memo
-        );
+      const linkId = makeLinkId(
+        recipient,
+        amount,
+        memo
+      );
+
+      const params = new URLSearchParams({
+        pay: linkId,
+        recipient,
+        amount,
+        memo,
+      });
 
       const url =
-        `${window.location.origin}/?pay=${linkId}` +
-        `&recipient=${encodeURIComponent(
-          recipient
-        )}` +
-        `&amount=${encodeURIComponent(
-          amount
-        )}` +
-        `&memo=${encodeURIComponent(
-          memo
-        )}`;
+        `${window.location.origin}/?${params.toString()}`;
 
       setPaymentLink(url);
 
       setStatus(
-        'Payment link created.'
+        'Payment link created successfully.'
       );
-    } catch {
+    } catch (error) {
+      console.error(error);
+
       setStatus(
         'Could not create payment link.'
       );
     }
   };
 
-  /*
-   * Copy payment link
-   */
+  /* =======================================================
+     COPY LINK
+  ======================================================= */
+
   const copyLink = async () => {
     if (!paymentLink) {
       return;
@@ -383,233 +476,238 @@ export default function Home() {
       }, 2000);
     } catch {
       setStatus(
-        'Could not copy the link.'
+        'Could not copy the payment link.'
       );
     }
   };
 
-  /*
-   * Load payment history
-   *
-   * Base RPC limits eth_getLogs to
-   * 10,000 blocks per request.
-   *
-   * So we query in smaller chunks.
-   */
-  const loadPaymentHistory =
-    async () => {
-      setHistoryLoading(true);
-      setHistoryError('');
+  /* =======================================================
+     LOAD PAYMENT HISTORY
+     
+     IMPORTANT:
+     - Does NOT scan millions of blocks.
+     - Searches only recent blocks.
+     - Uses small chunks.
+     - Avoids Base public RPC eth_getLogs range limits.
+  ======================================================= */
 
-      try {
-        const latestBlock =
-          await publicClient.getBlockNumber();
+  const loadPaymentHistory = async () => {
+    if (historyLoading) {
+      return;
+    }
 
-        const CHUNK_SIZE = 9_000n;
+    setHistoryLoading(true);
+    setHistoryError('');
 
-        const SEARCH_BLOCKS =
-          3_000_000n;
+    try {
+      const latestBlock =
+        await publicClient.getBlockNumber();
 
-        const startBlock =
-          latestBlock >
-          SEARCH_BLOCKS
-            ? latestBlock -
-              SEARCH_BLOCKS
-            : 0n;
+      /*
+       * Search only recent 50,000 blocks.
+       *
+       * Base produces blocks very quickly, so this is
+       * intentionally limited for an MVP.
+       *
+       * Increase this later if you need older history.
+       */
+      const SEARCH_BLOCKS = 50_000n;
 
-        const allLogs: Array<{
-          args?: {
-            linkId?: `0x${string}`;
-            payer?: Address;
-            recipient?: Address;
-            amount?: bigint;
-            memo?: string;
-          };
-          transactionHash:
-            | `0x${string}`
-            | null;
-          blockNumber:
-            | bigint
-            | null;
-        }> = [];
+      const CHUNK_SIZE = 5_000n;
 
-        let fromBlock =
-          startBlock;
+      const earliestBlock =
+        latestBlock > SEARCH_BLOCKS
+          ? latestBlock - SEARCH_BLOCKS
+          : 0n;
 
-        while (
-          fromBlock <= latestBlock
-        ) {
-          const toBlock =
-            fromBlock +
+      const allLogs: any[] = [];
+
+      /*
+       * Sequential chunks.
+       *
+       * We intentionally DO NOT Promise.all() these
+       * requests because parallel eth_getLogs calls can
+       * trigger RPC rate limits.
+       */
+      for (
+        let fromBlock = earliestBlock;
+        fromBlock <= latestBlock;
+        fromBlock += CHUNK_SIZE
+      ) {
+        const toBlock =
+          fromBlock + CHUNK_SIZE - 1n >
+          latestBlock
+            ? latestBlock
+            : fromBlock +
               CHUNK_SIZE -
-              1n <
-            latestBlock
-              ? fromBlock +
-                CHUNK_SIZE -
-                1n
-              : latestBlock;
+              1n;
 
+        try {
           const logs =
             await publicClient.getLogs({
-              address:
-                PAYMENT_CONTRACT,
+              address: PAYMENT_CONTRACT,
               event: paymentEvent,
               fromBlock,
               toBlock,
             });
 
-          allLogs.push(
-            ...logs.map(
-              (log) => ({
-                args:
-                  'args' in log
-                    ? (log.args as {
-                        linkId?: `0x${string}`;
-                        payer?: Address;
-                        recipient?: Address;
-                        amount?: bigint;
-                        memo?: string;
-                      })
-                    : undefined,
-                transactionHash:
-                  log.transactionHash,
-                blockNumber:
-                  log.blockNumber,
-              })
-            )
+          allLogs.push(...logs);
+        } catch (chunkError) {
+          console.warn(
+            'History chunk failed:',
+            {
+              fromBlock: fromBlock.toString(),
+              toBlock: toBlock.toString(),
+              error: chunkError,
+            }
           );
 
-          if (
-            toBlock >=
-            latestBlock
-          ) {
-            break;
-          }
-
-          fromBlock =
-            toBlock + 1n;
+          /*
+           * Continue with the next chunk instead of
+           * completely failing the history page.
+           */
         }
+      }
 
-        const items: PaymentItem[] =
-          [];
+      const items: PaymentItem[] = [];
 
-        for (
-          const log of allLogs
-        ) {
-          const args =
-            log.args;
-
-          if (!args) {
+      /*
+       * Decode logs manually.
+       *
+       * This avoids the TypeScript problem:
+       *
+       * Property 'args' does not exist on type 'Log'
+       */
+      for (const log of allLogs) {
+        try {
+          if (
+            !log.transactionHash ||
+            log.blockNumber === null
+          ) {
             continue;
           }
 
-          const payer =
-            args.payer;
-
-          const logRecipient =
-            args.recipient;
-
-          const logAmount =
-            args.amount;
-
-          const linkId =
-            args.linkId;
-
-          const logMemo =
-            args.memo;
-
-          const transactionHash =
-            log.transactionHash;
-
-          const blockNumber =
-            log.blockNumber;
+          const decoded =
+            decodeEventLog({
+              abi: paymentEventAbi,
+              data: log.data,
+              topics: log.topics,
+            });
 
           if (
-            !payer ||
-            !logRecipient ||
-            logAmount ===
-              undefined ||
-            !linkId ||
-            !transactionHash
+            decoded.eventName !== 'Payment'
+          ) {
+            continue;
+          }
+
+          const args =
+            decoded.args as {
+              linkId: HexString;
+              payer: Address;
+              recipient: Address;
+              amount: bigint;
+              memo: string;
+            };
+
+          if (
+            !args.linkId ||
+            !args.payer ||
+            !args.recipient ||
+            args.amount === undefined
           ) {
             continue;
           }
 
           items.push({
-            linkId,
-            payer,
-            recipient:
-              logRecipient,
-            amount:
-              logAmount,
-            memo:
-              logMemo || '',
-            txHash:
-              transactionHash,
-            blockNumber:
-              blockNumber || 0n,
+            linkId: args.linkId,
+            payer: args.payer,
+            recipient: args.recipient,
+            amount: args.amount,
+            memo: args.memo || '',
+            txHash: log.transactionHash,
+            blockNumber: log.blockNumber,
           });
+        } catch (decodeError) {
+          console.warn(
+            'Could not decode Payment event:',
+            decodeError
+          );
         }
-
-        items.sort(
-          (
-            a,
-            b
-          ) => {
-            if (
-              a.blockNumber >
-              b.blockNumber
-            ) {
-              return -1;
-            }
-
-            if (
-              a.blockNumber <
-              b.blockNumber
-            ) {
-              return 1;
-            }
-
-            return 0;
-          }
-        );
-
-        setPayments(items);
-        setHistoryLoaded(true);
-      } catch (error) {
-        console.error(
-          'Payment history error:',
-          error
-        );
-
-        setHistoryError(
-          error instanceof Error
-            ? error.message
-            : 'Could not load payment history.'
-        );
-      } finally {
-        setHistoryLoading(false);
       }
-    };
 
-  /*
-   * Load history on first page load
-   */
+      /*
+       * Remove duplicate transactions/logs.
+       */
+      const unique =
+        new Map<string, PaymentItem>();
+
+      for (const item of items) {
+        unique.set(
+          `${item.txHash}-${item.linkId}`,
+          item
+        );
+      }
+
+      const finalItems =
+        Array.from(unique.values());
+
+      /*
+       * Newest first
+       */
+      finalItems.sort(
+        (a, b) =>
+          Number(
+            b.blockNumber -
+              a.blockNumber
+          )
+      );
+
+      setPayments(finalItems);
+      setHistoryLoaded(true);
+
+      /*
+       * If chunks succeeded but no payments exist,
+       * that's not an error.
+       */
+      if (finalItems.length === 0) {
+        setHistoryError('');
+      }
+    } catch (error) {
+      console.error(
+        'Payment history error:',
+        error
+      );
+
+      setHistoryError(
+        error instanceof Error
+          ? error.message
+          : 'Could not load payment history.'
+      );
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  /* =======================================================
+     LOAD HISTORY ON PAGE LOAD
+  ======================================================= */
+
   useEffect(() => {
     loadPaymentHistory();
   }, []);
 
-  /*
-   * Pay USDC
-   *
-   * Builder Code is attached through
-   * dataSuffix on the wallet client.
-   */
+  /* =======================================================
+     PAY USDC
+  ======================================================= */
+
   const pay = async () => {
+    setStatus('');
+
     if (!window.ethereum) {
       setStatus(
         'Please install a browser wallet.'
       );
+
       return;
     }
 
@@ -617,32 +715,23 @@ export default function Home() {
       setStatus(
         'Connect your wallet first.'
       );
+
       return;
     }
 
-    if (
-      !/^0x[a-fA-F0-9]{40}$/.test(
-        recipient
-      )
-    ) {
+    if (!isValidAddress(recipient)) {
       setStatus(
         'Invalid recipient address.'
       );
+
       return;
     }
 
-    const numericAmount =
-      Number(amount);
-
-    if (
-      !Number.isFinite(
-        numericAmount
-      ) ||
-      numericAmount <= 0
-    ) {
+    if (!isValidAmount(amount)) {
       setStatus(
-        'Enter a valid amount.'
+        'Enter a valid USDC amount.'
       );
+
       return;
     }
 
@@ -651,50 +740,96 @@ export default function Home() {
       setTx('');
 
       /*
-       * Builder Code attribution
+       * Make sure wallet is on Base.
+       */
+      try {
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [
+            {
+              chainId: '0x2105',
+            },
+          ],
+        });
+      } catch {
+        /*
+         * If switch fails, continue because some wallets
+         * already report the correct network.
+         */
+      }
+
+      /*
+       * Wallet client with Builder Code attribution.
+       *
+       * DATA_SUFFIX is generated by:
+       *
+       * Attribution.toDataSuffix({
+       *   codes: ['bc_0i1qmqg3']
+       * })
        */
       const wallet =
         createWalletClient({
+          account: address,
           chain: base,
-          transport:
-            custom(
-              window.ethereum
-            ),
-          dataSuffix:
-            DATA_SUFFIX,
+          transport: custom(
+            window.ethereum
+          ),
+          dataSuffix: DATA_SUFFIX,
         });
 
-      const value =
-        parseUnits(
-          amount,
-          6
-        );
+      /*
+       * Convert USDC amount to 6 decimals.
+       */
+      const value = parseUnits(
+        amount,
+        6
+      );
 
-      const linkId =
-        makeLinkId(
-          recipient,
-          amount,
-          memo
-        );
+      /*
+       * Generate payment link ID.
+       */
+      const linkId = makeLinkId(
+        recipient,
+        amount,
+        memo
+      );
 
       /*
        * Step 1
+       *
+       * Approve payment contract to spend USDC.
        */
       setStatus(
         'Step 1/2: Approve USDC in your wallet...'
       );
 
-      await wallet.writeContract({
-        address: USDC,
-        abi: erc20Abi,
-        functionName:
-          'approve',
-        args: [
-          PAYMENT_CONTRACT,
-          value,
-        ],
-        account: address,
-      });
+      const approvalHash =
+        await wallet.writeContract({
+          address: USDC,
+          abi: erc20Abi,
+          functionName: 'approve',
+          args: [
+            PAYMENT_CONTRACT,
+            value,
+          ],
+          account: address,
+        });
+
+      /*
+       * Wait for approval confirmation.
+       *
+       * This is important because sending pay() immediately
+       * after approval can sometimes race the RPC.
+       */
+      setStatus(
+        'Waiting for USDC approval confirmation...'
+      );
+
+      await publicClient.waitForTransactionReceipt(
+        {
+          hash: approvalHash,
+        }
+      );
 
       /*
        * Step 2
@@ -705,14 +840,12 @@ export default function Home() {
 
       const hash =
         await wallet.writeContract({
-          address:
-            PAYMENT_CONTRACT,
+          address: PAYMENT_CONTRACT,
           abi: paymentAbi,
-          functionName:
-            'pay',
+          functionName: 'pay',
           args: [
             linkId,
-            recipient as Address,
+            getAddress(recipient),
             value,
             memo,
           ],
@@ -721,22 +854,38 @@ export default function Home() {
 
       setTx(hash);
 
-      setPaymentSuccess(
-        true
+      setStatus(
+        'Payment submitted. Waiting for confirmation...'
       );
 
-      setStatus('');
+      /*
+       * Wait for payment confirmation.
+       */
+      await publicClient.waitForTransactionReceipt(
+        {
+          hash,
+        }
+      );
+
+      setPaymentSuccess(true);
+      setStatus(
+        'Payment confirmed successfully.'
+      );
 
       /*
-       * Refresh history
+       * Give RPC/indexer a little time before history
+       * refresh.
        */
       setTimeout(() => {
         loadPaymentHistory();
-      }, 5000);
+      }, 3000);
     } catch (error) {
-      setPaymentSuccess(
-        false
+      console.error(
+        'Payment error:',
+        error
       );
+
+      setPaymentSuccess(false);
 
       setStatus(
         error instanceof Error
@@ -746,66 +895,114 @@ export default function Home() {
     }
   };
 
-  /*
-   * Reset payment
-   */
+  /* =======================================================
+     RESET PAYMENT
+  ======================================================= */
+
   const resetPayment = () => {
-    setPaymentSuccess(
-      false
-    );
-
+    setPaymentSuccess(false);
     setTx('');
-
     setStatus('');
   };
 
-  /*
-   * Statistics
-   */
-  const totalVolume =
-    useMemo(
-      () =>
-        payments.reduce(
-          (
-            total,
-            payment
-          ) =>
-            total +
-            payment.amount,
-          0n
-        ),
-      [payments]
-    );
+  /* =======================================================
+     SHARE
+  ======================================================= */
 
-  const myPayments =
-    address
-      ? payments.filter(
-          (payment) =>
-            payment.payer.toLowerCase() ===
-            address.toLowerCase()
-        )
-      : [];
+  const sharePaymentLink = async () => {
+    if (!paymentLink) {
+      return;
+    }
+
+    try {
+      if (navigator.share) {
+        await navigator.share({
+          title:
+            'BasePayLink Payment',
+          text:
+            `Pay ${amount} USDC`,
+          url: paymentLink,
+        });
+      } else {
+        await copyLink();
+      }
+    } catch {
+      /*
+       * User cancelled share dialog.
+       */
+    }
+  };
+
+  /* =======================================================
+     STATISTICS
+  ======================================================= */
+
+  const totalVolume = useMemo(
+    () =>
+      payments.reduce(
+        (total, payment) =>
+          total + payment.amount,
+        0n
+      ),
+    [payments]
+  );
+
+  const myPayments = useMemo(
+    () =>
+      address
+        ? payments.filter(
+            (payment) =>
+              payment.payer.toLowerCase() ===
+              address.toLowerCase()
+          )
+        : [],
+    [payments, address]
+  );
+
+  /* =======================================================
+     RENDER
+  ======================================================= */
 
   return (
     <main className="container">
+
+      {/* =================================================
+          HEADER
+      ================================================= */}
+
       <div className="badge">
         BASE MAINNET
       </div>
 
-      <h1>
-        BasePayLink
-      </h1>
+      <h1>BasePayLink</h1>
 
       <p className="subtitle">
-        Simple USDC payments
-        powered by Base.
+        Simple USDC payments powered by Base.
       </p>
 
-      {/*
-       * PAYMENT REQUEST PAGE
-       */}
+      {/* =================================================
+          BUILDER CODE
+      ================================================= */}
+
+      <div
+        className="builder-badge"
+        style={{
+          marginBottom: '24px',
+          textAlign: 'center',
+          opacity: 0.8,
+          fontSize: '13px',
+        }}
+      >
+        Builder Code: {BUILDER_CODE}
+      </div>
+
+      {/* =================================================
+          PAYMENT REQUEST PAGE
+      ================================================= */}
+
       {isPaymentPage ? (
         <section className="card payment-card">
+
           <div className="section-number">
             PAYMENT REQUEST
           </div>
@@ -815,6 +1012,7 @@ export default function Home() {
           </h2>
 
           <div className="payment-summary">
+
             <div>
               <span>
                 Amount
@@ -846,13 +1044,12 @@ export default function Home() {
                 {memo}
               </strong>
             </div>
+
           </div>
 
           {!address && (
             <button
-              onClick={
-                connect
-              }
+              onClick={connect}
             >
               Connect Wallet
             </button>
@@ -876,6 +1073,7 @@ export default function Home() {
           {paymentSuccess &&
             tx && (
               <div className="success">
+
                 <h3>
                   ✓ Payment Successful
                 </h3>
@@ -899,8 +1097,7 @@ export default function Home() {
                   target="_blank"
                   rel="noreferrer"
                 >
-                  View Transaction
-                  on BaseScan →
+                  View Transaction on BaseScan →
                 </a>
 
                 <button
@@ -910,15 +1107,19 @@ export default function Home() {
                 >
                   New Payment
                 </button>
+
               </div>
             )}
+
         </section>
       ) : (
         <>
-          {/*
-           * WALLET
-           */}
+          {/* =================================================
+              01 WALLET
+          ================================================= */}
+
           <section className="card">
+
             <div className="section-number">
               01
             </div>
@@ -932,9 +1133,7 @@ export default function Home() {
             </h2>
 
             <button
-              onClick={
-                connect
-              }
+              onClick={connect}
             >
               {address
                 ? shortAddress(
@@ -945,16 +1144,18 @@ export default function Home() {
 
             {address && (
               <p className="status">
-                ✓ Connected to Base
-                Mainnet
+                ✓ Connected to Base Mainnet
               </p>
             )}
+
           </section>
 
-          {/*
-           * CREATE PAYMENT LINK
-           */}
+          {/* =================================================
+              02 PAYMENT LINK
+          ================================================= */}
+
           <section className="card">
+
             <div className="section-number">
               02
             </div>
@@ -973,15 +1174,10 @@ export default function Home() {
 
             <input
               placeholder="0x..."
-              value={
-                recipient
-              }
-              onChange={(
-                event
-              ) =>
+              value={recipient}
+              onChange={(event) =>
                 setRecipient(
-                  event.target
-                    .value
+                  event.target.value
                 )
               }
             />
@@ -992,17 +1188,12 @@ export default function Home() {
 
             <input
               type="number"
-              min="0.01"
+              min="0.000001"
               step="0.01"
-              value={
-                amount
-              }
-              onChange={(
-                event
-              ) =>
+              value={amount}
+              onChange={(event) =>
                 setAmount(
-                  event.target
-                    .value
+                  event.target.value
                 )
               }
             />
@@ -1013,12 +1204,9 @@ export default function Home() {
 
             <input
               value={memo}
-              onChange={(
-                event
-              ) =>
+              onChange={(event) =>
                 setMemo(
-                  event.target
-                    .value
+                  event.target.value
                 )
               }
             />
@@ -1032,44 +1220,65 @@ export default function Home() {
             </button>
 
             {paymentLink && (
-              <div className="link-result">
+              <div
+                className="link-box"
+                style={{
+                  marginTop: '20px',
+                }}
+              >
+
                 <p>
-                  Payment link
-                  created:
+                  <strong>
+                    Payment Link
+                  </strong>
                 </p>
 
                 <input
                   readOnly
-                  value={
-                    paymentLink
-                  }
-                  onFocus={(
-                    event
-                  ) =>
+                  value={paymentLink}
+                  onFocus={(event) =>
                     event.currentTarget.select()
                   }
                 />
 
-                <button
-                  onClick={
-                    copyLink
-                  }
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: '10px',
+                    flexWrap: 'wrap',
+                    marginTop: '10px',
+                  }}
                 >
-                  {copied
-                    ? '✓ Copied'
-                    : 'Copy Link'}
-                </button>
 
-                <div className="qr-box">
-                  <h3>
-                    Scan to Pay
-                  </h3>
+                  <button
+                    onClick={copyLink}
+                  >
+                    {copied
+                      ? '✓ Copied'
+                      : 'Copy Link'}
+                  </button>
+
+                  <button
+                    onClick={
+                      sharePaymentLink
+                    }
+                  >
+                    Share
+                  </button>
+
+                </div>
+
+                <div
+                  style={{
+                    marginTop: '20px',
+                    textAlign: 'center',
+                  }}
+                >
 
                   <p>
-                    Scan this QR
-                    code to open
-                    the payment
-                    request.
+                    <strong>
+                      Scan to Pay
+                    </strong>
                   </p>
 
                   <QRCodeSVG
@@ -1080,29 +1289,8 @@ export default function Home() {
                     level="M"
                   />
 
-                  <button
-                    onClick={() => {
-                      if (
-                        navigator.share
-                      ) {
-                        navigator.share(
-                          {
-                            title:
-                              'BasePayLink Payment',
-                            text:
-                              `Pay ${amount} USDC`,
-                            url:
-                              paymentLink,
-                          }
-                        );
-                      } else {
-                        copyLink();
-                      }
-                    }}
-                  >
-                    Share
-                  </button>
                 </div>
+
               </div>
             )}
 
@@ -1111,12 +1299,15 @@ export default function Home() {
                 {status}
               </p>
             )}
+
           </section>
 
-          {/*
-           * DIRECT PAYMENT
-           */}
+          {/* =================================================
+              03 DIRECT USDC PAYMENT
+          ================================================= */}
+
           <section className="card">
+
             <div className="section-number">
               03
             </div>
@@ -1135,15 +1326,10 @@ export default function Home() {
 
             <input
               placeholder="0x..."
-              value={
-                recipient
-              }
-              onChange={(
-                event
-              ) =>
+              value={recipient}
+              onChange={(event) =>
                 setRecipient(
-                  event.target
-                    .value
+                  event.target.value
                 )
               }
             />
@@ -1154,17 +1340,12 @@ export default function Home() {
 
             <input
               type="number"
-              min="0.01"
+              min="0.000001"
               step="0.01"
-              value={
-                amount
-              }
-              onChange={(
-                event
-              ) =>
+              value={amount}
+              onChange={(event) =>
                 setAmount(
-                  event.target
-                    .value
+                  event.target.value
                 )
               }
             />
@@ -1175,21 +1356,16 @@ export default function Home() {
 
             <input
               value={memo}
-              onChange={(
-                event
-              ) =>
+              onChange={(event) =>
                 setMemo(
-                  event.target
-                    .value
+                  event.target.value
                 )
               }
             />
 
             <button
               disabled={!address}
-              onClick={
-                pay
-              }
+              onClick={pay}
             >
               {address
                 ? 'Pay USDC'
@@ -1205,15 +1381,14 @@ export default function Home() {
             {paymentSuccess &&
               tx && (
                 <div className="success">
+
                   <h3>
-                    ✓ Payment
-                    Successful
+                    ✓ Payment Successful
                   </h3>
 
                   <p>
                     <strong>
-                      {amount}{' '}
-                      USDC
+                      {amount} USDC
                     </strong>{' '}
                     paid successfully.
                   </p>
@@ -1230,8 +1405,7 @@ export default function Home() {
                     target="_blank"
                     rel="noreferrer"
                   >
-                    View Transaction
-                    on BaseScan →
+                    View Transaction on BaseScan →
                   </a>
 
                   <button
@@ -1239,17 +1413,20 @@ export default function Home() {
                       resetPayment
                     }
                   >
-                    Create New
-                    Payment
+                    Create New Payment
                   </button>
+
                 </div>
               )}
+
           </section>
 
-          {/*
-           * PAYMENT HISTORY
-           */}
-          <section className="card history-card">
+          {/* =================================================
+              04 PAYMENT HISTORY
+          ================================================= */}
+
+          <section className="card">
+
             <div className="section-number">
               04
             </div>
@@ -1258,15 +1435,29 @@ export default function Home() {
               ACTIVITY
             </div>
 
-            <div className="history-header">
+            <div
+              style={{
+                display: 'flex',
+                justifyContent:
+                  'space-between',
+                alignItems: 'center',
+                gap: '12px',
+                flexWrap: 'wrap',
+              }}
+            >
+
               <div>
                 <h2>
                   Payment History
                 </h2>
 
-                <p>
-                  On-chain USDC
-                  payment activity
+                <p
+                  style={{
+                    marginTop: '4px',
+                    opacity: 0.7,
+                  }}
+                >
+                  On-chain USDC payment activity
                 </p>
               </div>
 
@@ -1282,14 +1473,24 @@ export default function Home() {
                   ? 'Loading...'
                   : 'Refresh History'}
               </button>
+
             </div>
 
+            {/* HISTORY ERROR */}
+
             {historyError && (
-              <div className="error-box">
-                <strong>
-                  Could not load
-                  payment history.
-                </strong>
+              <div
+                className="history-error"
+                style={{
+                  marginTop: '20px',
+                }}
+              >
+
+                <p>
+                  <strong>
+                    Could not load payment history.
+                  </strong>
+                </p>
 
                 <p>
                   {historyError}
@@ -1299,38 +1500,54 @@ export default function Home() {
                   onClick={
                     loadPaymentHistory
                   }
+                  disabled={
+                    historyLoading
+                  }
                 >
-                  Try Again
+                  {historyLoading
+                    ? 'Retrying...'
+                    : 'Try Again'}
                 </button>
+
               </div>
             )}
 
+            {/* HISTORY LOADING */}
+
             {!historyError &&
               historyLoading && (
-                <div className="loading">
-                  Loading payment
-                  history...
-                </div>
+                <p className="status">
+                  Loading payment history...
+                </p>
               )}
+
+            {/* HISTORY */}
 
             {!historyError &&
               !historyLoading &&
               historyLoaded && (
                 <>
-                  <div className="stats-grid">
-                    <div className="stat-card">
+
+                  {/* STATISTICS */}
+
+                  <div
+                    className="payment-summary"
+                    style={{
+                      marginTop: '20px',
+                    }}
+                  >
+
+                    <div>
                       <span>
                         Payments
                       </span>
 
                       <strong>
-                        {
-                          payments.length
-                        }
+                        {payments.length}
                       </strong>
                     </div>
 
-                    <div className="stat-card">
+                    <div>
                       <span>
                         Total Volume
                       </span>
@@ -1344,37 +1561,57 @@ export default function Home() {
                       </strong>
                     </div>
 
-                    <div className="stat-card">
+                    <div>
                       <span>
                         My Payments
                       </span>
 
                       <strong>
-                        {
-                          myPayments.length
-                        }
+                        {myPayments.length}
                       </strong>
                     </div>
+
                   </div>
 
-                  {payments.length ===
-                  0 ? (
-                    <div className="empty">
-                      <h3>
-                        No payments yet
-                      </h3>
+                  {/* EMPTY */}
+
+                  {payments.length === 0 ? (
+                    <div
+                      className="status"
+                      style={{
+                        marginTop: '20px',
+                      }}
+                    >
 
                       <p>
-                        Payments made
-                        through the
-                        BasePayLink
-                        contract will
-                        appear here.
+                        No recent payments found.
                       </p>
+
+                      <p>
+                        Payment history currently
+                        searches the latest 50,000
+                        Base blocks.
+                      </p>
+
                     </div>
                   ) : (
-                    <div className="table-wrapper">
-                      <table>
+                    <div
+                      className="table-wrapper"
+                      style={{
+                        marginTop: '20px',
+                        overflowX: 'auto',
+                      }}
+                    >
+
+                      <table
+                        className="payment-table"
+                        style={{
+                          width: '100%',
+                          borderCollapse:
+                            'collapse',
+                        }}
+                      >
+
                         <thead>
                           <tr>
                             <th>
@@ -1406,8 +1643,9 @@ export default function Home() {
                               index
                             ) => (
                               <tr
-                                key={`${payment.txHash}-${index}`}
+                                key={`${payment.txHash}-${payment.linkId}-${index}`}
                               >
+
                                 <td>
                                   <strong>
                                     {formatUnits(
@@ -1441,38 +1679,28 @@ export default function Home() {
                                     target="_blank"
                                     rel="noreferrer"
                                   >
-                                    View on
-                                    BaseScan
-                                    →
+                                    View on BaseScan →
                                   </a>
                                 </td>
+
                               </tr>
                             )
                           )}
                         </tbody>
+
                       </table>
+
                     </div>
                   )}
+
                 </>
               )}
+
           </section>
+
         </>
       )}
 
-      <footer>
-        <span>
-          BasePayLink
-        </span>
-
-        <span>
-          Built on Base Mainnet
-        </span>
-
-        <span>
-          Builder Code:{' '}
-          {BUILDER_CODE}
-        </span>
-      </footer>
     </main>
   );
 }
